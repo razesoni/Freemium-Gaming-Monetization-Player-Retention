@@ -1,0 +1,16 @@
+# Byte-compiled / optimized / IDE
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Data & Large Artifacts
+data/raw/*.csv
+data/processed/*.csv
+outputs/models/*.pkl
+outputs/models/*.joblib
+
+# Environment
+.env
+venv/
