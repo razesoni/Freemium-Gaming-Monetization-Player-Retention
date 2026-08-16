@@ -1,179 +1,307 @@
-import json
 import io
+import json
 import pandas as pd
 from flask import Flask, render_template, request, jsonify, Response
 import plotly.express as px
 import plotly.graph_objects as go
 
 from src.data_loader import load_raw_data, clean_game_data, filter_gaming_dataset
-from src.monetization import calculate_arpu, segment_revenue_contribution, genre_monetization_depth
+from src.monetization import segment_revenue_contribution, genre_monetization_depth
 from src.player_analysis import calculate_correlation_matrix
+from src.llm_insights import generate_llm_insights
 
 app = Flask(__name__)
 
-# --- Load & Clean Data on Startup ---
 try:
     RAW_DF = load_raw_data()
     PAYING_DF, F2P_DF = clean_game_data(RAW_DF)
     BASE_DF = pd.concat([PAYING_DF, F2P_DF], ignore_index=True)
 except Exception as e:
     print(f"Dataset load error: {e}")
-    # Minimal fallback schema
     BASE_DF = pd.DataFrame(columns=[
         "UserID", "Age", "Gender", "Country", "Device", "GameGenre",
         "SessionCount", "AverageSessionLength", "SpendingSegment",
-        "InAppPurchaseAmount", "FirstPurchaseDaysAfterInstall", "PaymentMethod", "LastPurchaseDate"
+        "InAppPurchaseAmount", "FirstPurchaseDaysAfterInstall",
+        "PaymentMethod", "LastPurchaseDate"
     ])
 
-def style_plotly_chart(fig: go.Figure) -> go.Figure:
-    """Applies high-contrast dark & neon gaming styling."""
+def style_plotly_chart(fig, height=390):
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#F3F4F6", family="sans-serif", size=12),
-        margin=dict(l=25, r=25, t=45, b=25),
+        font=dict(color="#E5E7EB", family="Inter, system-ui, sans-serif", size=12),
+        margin=dict(l=45, r=25, t=50, b=45),
+        height=height,
+        hoverlabel=dict(bgcolor="#111827", font_color="#F9FAFB"),
         legend=dict(
-            font=dict(color="#F3F4F6"),
-            bgcolor="rgba(17, 24, 39, 0.7)",
-            bordercolor="rgba(255, 255, 255, 0.15)",
+            font=dict(color="#E5E7EB"),
+            bgcolor="rgba(17,24,39,.65)",
+            bordercolor="rgba(255,255,255,.10)",
             borderwidth=1
         )
     )
     fig.update_xaxes(
-        tickfont=dict(color="#D1D5DB"),
-        title_font=dict(color="#F9FAFB"),
+        tickfont=dict(color="#A7B0C0"),
+        title_font=dict(color="#DDE3EE"),
         showgrid=True,
-        gridcolor="rgba(255, 255, 255, 0.08)",
+        gridcolor="rgba(255,255,255,.07)",
         zeroline=False
     )
     fig.update_yaxes(
-        tickfont=dict(color="#D1D5DB"),
-        title_font=dict(color="#F9FAFB"),
+        tickfont=dict(color="#A7B0C0"),
+        title_font=dict(color="#DDE3EE"),
         showgrid=True,
-        gridcolor="rgba(255, 255, 255, 0.08)",
+        gridcolor="rgba(255,255,255,.07)",
         zeroline=False
     )
     return fig
 
+def fig_json(fig):
+    return json.loads(style_plotly_chart(fig).to_json())
+
+def safe_num(v):
+    return float(v) if pd.notna(v) else 0.0
+
+def generate_insights(df: pd.DataFrame, paying: pd.DataFrame) -> list:
+    if df.empty:
+        return ["No player data matches the current filter criteria."]
+
+    insights = []
+    total_users = df["UserID"].nunique()
+    paying_users = paying["UserID"].nunique() if not paying.empty else 0
+    total_rev = safe_num(paying["InAppPurchaseAmount"].sum()) if not paying.empty else 0.0
+
+    if not paying.empty and total_rev > 0:
+        # Whale Concentration Insight
+        whales = paying[paying["SpendingSegment"] == "Whale"]
+        if not whales.empty:
+            whale_rev = whales["InAppPurchaseAmount"].sum()
+            whale_rev_pct = (whale_rev / total_rev) * 100
+            whale_user_pct = (whales["UserID"].nunique() / paying_users) * 100
+            insights.append(
+                f"<strong>Whale Concentration:</strong> Whales make up <strong>{whale_user_pct:.1f}%</strong> of paying users but contribute <strong>{whale_rev_pct:.1f}%</strong> (${whale_rev:,.2f}) of gross revenue."
+            )
+
+        # Top Performing Genre
+        genre_summary = paying.groupby("GameGenre")["InAppPurchaseAmount"].sum()
+        if not genre_summary.empty:
+            top_genre = genre_summary.idxmax()
+            top_genre_rev = genre_summary.max()
+            top_genre_pct = (top_genre_rev / total_rev) * 100
+            insights.append(
+                f"<strong>Top Monetizing Genre:</strong> <strong>{top_genre}</strong> is the highest revenue driver, generating <strong>{top_genre_pct:.1f}%</strong> (${top_genre_rev:,.2f}) of total revenue."
+            )
+
+        # Top Monetizing Device (ARPPU)
+        device_rev = paying.groupby("Device").agg(Revenue=("InAppPurchaseAmount", "sum"), Users=("UserID", "nunique"))
+        device_rev["ARPPU"] = device_rev["Revenue"] / device_rev["Users"]
+        if not device_rev.empty:
+            top_device = device_rev["ARPPU"].idxmax()
+            insights.append(
+                f"<strong>Platform Value Leader:</strong> <strong>{top_device}</strong> leads monetization depth with an ARPPU of <strong>${device_rev.loc[top_device, 'ARPPU']:,.2f}</strong>."
+            )
+
+        # Time to Conversion Latency
+        if "FirstPurchaseDaysAfterInstall" in paying.columns:
+            median_latency = paying["FirstPurchaseDaysAfterInstall"].dropna()
+            median_latency = median_latency[median_latency >= 0].median()
+            if pd.notna(median_latency):
+                insights.append(
+                    f"<strong>Conversion Window:</strong> The median time from install to first purchase is <strong>{median_latency:.1f} days</strong>."
+                )
+    else:
+        insights.append("<strong>Zero Paying Users:</strong> The selected player cohort consists exclusively of non-paying players (0% conversion).")
+
+    return insights
+
 def generate_analytics_payload(df: pd.DataFrame):
-    paying_cohort = df[df["InAppPurchaseAmount"] > 0]
-    f2p_cohort = df[(df["InAppPurchaseAmount"].isna()) | (df["InAppPurchaseAmount"] == 0)]
-    
-    total_rev = paying_cohort["InAppPurchaseAmount"].sum() if not paying_cohort.empty else 0.0
-    paying_users = paying_cohort["UserID"].nunique() if not paying_cohort.empty else 0
-    f2p_users = f2p_cohort["UserID"].nunique() if not f2p_cohort.empty else 0
-    arppu = (total_rev / paying_users) if paying_users > 0 else 0.0
+    paying = df[df["InAppPurchaseAmount"].fillna(0) > 0].copy()
+    f2p = df[df["InAppPurchaseAmount"].fillna(0) <= 0].copy()
+
+    total_rev = safe_num(paying["InAppPurchaseAmount"].sum()) if not paying.empty else 0
+    paying_users = paying["UserID"].nunique() if not paying.empty else 0
+    f2p_users = f2p["UserID"].nunique() if not f2p.empty else 0
+    total_users = df["UserID"].nunique() if not df.empty else 0
+    arppu = total_rev / paying_users if paying_users else 0
+    conversion_rate = paying_users / total_users * 100 if total_users else 0
+    avg_sessions = safe_num(paying["SessionCount"].mean()) if not paying.empty else 0
+    avg_session_length = safe_num(paying["AverageSessionLength"].mean()) if not paying.empty else 0
 
     kpis = {
         "total_revenue": f"${total_rev:,.2f}",
         "paying_users": f"{paying_users:,}",
         "f2p_users": f"{f2p_users:,}",
-        "arppu": f"${arppu:.2f}"
+        "arppu": f"${arppu:,.2f}",
+        "total_users": f"{total_users:,}",
+        "conversion_rate": f"{conversion_rate:.1f}%",
+        "avg_sessions": f"{avg_sessions:.1f}",
+        "avg_session_length": f"{avg_session_length:.1f}"
     }
 
     charts = {}
 
-    if not paying_cohort.empty:
-        # --- TAB 1: Monetization & Pareto Concentration ---
-        seg_summary = segment_revenue_contribution(paying_cohort)
-        
-        # 1. Revenue Pareto Doughnut
-        fig_pareto = px.pie(
-            seg_summary, values="TotalRevenue", names="SpendingSegment", hole=0.45,
-            color="SpendingSegment",
-            color_discrete_map={"Whale": "#FF6B00", "Dolphin": "#3B82F6", "Minnow": "#10B981"}
-        )
-        fig_pareto.update_traces(textposition="inside", textinfo="percent+label")
-        charts["fig_pareto"] = json.loads(style_plotly_chart(fig_pareto).to_json())
+    # 1. Revenue concentration
+    if not paying.empty:
+        seg_summary = segment_revenue_contribution(paying)
+        if not seg_summary.empty:
+            charts["fig_pareto"] = fig_json(px.pie(
+                seg_summary, values="TotalRevenue", names="SpendingSegment",
+                hole=.50, title="Revenue concentration by spending segment"
+            ))
 
-        # 2. Total Revenue by Genre
-        genre_rev = paying_cohort.groupby("GameGenre")["InAppPurchaseAmount"].sum().reset_index().sort_values(by="InAppPurchaseAmount", ascending=False)
-        fig_genre_rev = px.bar(
-            genre_rev, x="InAppPurchaseAmount", y="GameGenre", orientation="h",
-            color="InAppPurchaseAmount", color_continuous_scale="Inferno"
+        # 2. Revenue by genre
+        genre_rev = (
+            paying.groupby("GameGenre", as_index=False)["InAppPurchaseAmount"]
+            .sum().sort_values("InAppPurchaseAmount", ascending=True)
         )
-        fig_genre_rev.update_layout(yaxis=dict(autorange="reversed"))
-        charts["fig_genre_rev"] = json.loads(style_plotly_chart(fig_genre_rev).to_json())
+        if not genre_rev.empty:
+            charts["fig_genre_rev"] = fig_json(px.bar(
+                genre_rev, x="InAppPurchaseAmount", y="GameGenre", orientation="h",
+                title="Gross revenue by game genre"
+            ))
 
-        # 3. Genre Depth (Whale vs Dolphin vs Minnow average spend)
-        depth_df = genre_monetization_depth(paying_cohort)
-        fig_depth = px.bar(
-            depth_df, x="GameGenre", y=[c for c in ["Whale", "Dolphin", "Minnow"] if c in depth_df.columns],
-            barmode="group", color_discrete_map={"Whale": "#FF6B00", "Dolphin": "#38BDF8", "Minnow": "#4ADE80"}
-        )
-        fig_depth.update_layout(xaxis_tickangle=-35)
-        charts["fig_depth"] = json.loads(style_plotly_chart(fig_depth).to_json())
+        # 3. Genre × segment monetization depth
+        depth = genre_monetization_depth(paying)
+        if not depth.empty:
+            cols = [c for c in ["Whale", "Dolphin", "Minnow"] if c in depth.columns]
+            if cols:
+                charts["fig_depth"] = fig_json(px.bar(
+                    depth, x="GameGenre", y=cols, barmode="group",
+                    title="Average spend by genre and spending segment"
+                ))
 
-        # --- TAB 2: Engagement vs Monetization Correlation ---
-        # 4. Correlation Heatmap
-        corr = calculate_correlation_matrix(paying_cohort)
+        # 4. Correlation heatmap
+        corr = calculate_correlation_matrix(paying)
         if not corr.empty:
-            fig_corr = px.imshow(
-                corr, text_auto=True, aspect="auto",
-                color_continuous_scale="Viridis"
-            )
-            charts["fig_corr"] = json.loads(style_plotly_chart(fig_corr).to_json())
+            charts["fig_corr"] = fig_json(px.imshow(
+                corr, text_auto=".2f", aspect="auto",
+                title="Numerical feature correlation"
+            ))
 
-        # 5. Session Count vs IAP Amount Scatter
-        fig_scatter = px.scatter(
-            paying_cohort, x="SessionCount", y="InAppPurchaseAmount",
-            color="SpendingSegment", hover_data=["Age", "GameGenre"],
-            color_discrete_map={"Whale": "#FF6B00", "Dolphin": "#38BDF8", "Minnow": "#10B981"}
-        )
-        charts["fig_scatter"] = json.loads(style_plotly_chart(fig_scatter).to_json())
+        # 5. Session count vs purchase amount
+        charts["fig_scatter"] = fig_json(px.scatter(
+            paying, x="SessionCount", y="InAppPurchaseAmount",
+            color="SpendingSegment",
+            hover_data=[c for c in ["Age", "GameGenre", "Device"] if c in paying.columns],
+            title="Session count vs in-app purchase amount"
+        ))
 
-        # 6. Average Session Length Distribution
-        fig_session_box = px.box(
-            paying_cohort, x="SpendingSegment", y="AverageSessionLength",
-            color="SpendingSegment", color_discrete_map={"Whale": "#FF6B00", "Dolphin": "#38BDF8", "Minnow": "#10B981"}
-        )
-        charts["fig_session_box"] = json.loads(style_plotly_chart(fig_session_box).to_json())
+        # 6. Session length by segment
+        charts["fig_session_box"] = fig_json(px.box(
+            paying, x="SpendingSegment", y="AverageSessionLength",
+            color="SpendingSegment", points=False,
+            title="Average session length across spending tiers"
+        ))
 
-        # --- TAB 3: Cohort & Demographics ---
-        # 7. Device ARPU Split
-        device_df = paying_cohort.groupby("Device").agg(
+        # 7. Device ARPU
+        device_df = paying.groupby("Device").agg(
             Revenue=("InAppPurchaseAmount", "sum"),
             Users=("UserID", "nunique")
         ).reset_index()
-        device_df["ARPU"] = (device_df["Revenue"] / device_df["Users"]).round(2)
-        fig_device = px.bar(
-            device_df, x="Device", y="ARPU", color="Device",
-            color_discrete_map={"iOS": "#38BDF8", "Android": "#10B981", "Other": "#9CA3AF"}
-        )
-        charts["fig_device"] = json.loads(style_plotly_chart(fig_device).to_json())
+        device_df["ARPU"] = device_df["Revenue"] / device_df["Users"].replace(0, pd.NA)
+        charts["fig_device"] = fig_json(px.bar(
+            device_df.sort_values("ARPU", ascending=False),
+            x="Device", y="ARPU", text_auto=".2f",
+            title="ARPU by device platform"
+        ))
 
-        # 8. Top Countries by Player Volume
+        # 8. Country player volume
         country_df = df["Country"].value_counts().head(10).reset_index()
         country_df.columns = ["Country", "Players"]
-        fig_country = px.bar(
-            country_df, x="Country", y="Players", color="Players",
-            color_continuous_scale="Teal"
-        )
-        fig_country.update_layout(xaxis_tickangle=-35)
-        charts["fig_country"] = json.loads(style_plotly_chart(fig_country).to_json())
+        charts["fig_country"] = fig_json(px.bar(
+            country_df.sort_values("Players"),
+            x="Players", y="Country", orientation="h",
+            title="Top countries by player volume"
+        ))
 
-        # 9. Days to First Purchase (Latency)
-        latency_df = paying_cohort["FirstPurchaseDaysAfterInstall"].dropna()
-        fig_latency = px.histogram(
-            latency_df, nbins=30, color_discrete_sequence=["#FF6B00"]
-        )
-        charts["fig_latency"] = json.loads(style_plotly_chart(fig_latency).to_json())
+        # 9. Conversion latency
+        if "FirstPurchaseDaysAfterInstall" in paying.columns:
+            latency = paying["FirstPurchaseDaysAfterInstall"].dropna()
+            latency = latency[latency >= 0]
+            if not latency.empty:
+                charts["fig_latency"] = fig_json(px.histogram(
+                    latency, nbins=30,
+                    title="Time to first purchase"
+                ))
 
-    # Raw table sample preview
-    cols = [
-        col for col in [
-            "UserID", "Age", "Gender", "Country", "Device", "GameGenre",
-            "SessionCount", "AverageSessionLength", "SpendingSegment",
-            "InAppPurchaseAmount", "FirstPurchaseDaysAfterInstall", "PaymentMethod"
-        ] if col in df.columns
-    ]
-    table_data = df[cols].head(50).to_dict(orient="records")
+        # 10. Revenue by spending segment
+        seg_rev = paying.groupby("SpendingSegment", as_index=False)["InAppPurchaseAmount"].sum()
+        charts["fig_segment_revenue"] = fig_json(px.bar(
+            seg_rev.sort_values("InAppPurchaseAmount", ascending=False),
+            x="SpendingSegment", y="InAppPurchaseAmount", text_auto=".2f",
+            title="Total revenue by spending segment"
+        ))
+
+        # 11. Average revenue by country
+        country_arpu = (
+            paying.groupby("Country", as_index=False)["InAppPurchaseAmount"]
+            .mean().rename(columns={"InAppPurchaseAmount": "AverageRevenue"})
+            .sort_values("AverageRevenue", ascending=False).head(10)
+        )
+        if not country_arpu.empty:
+            charts["fig_country_arpu"] = fig_json(px.bar(
+                country_arpu.sort_values("AverageRevenue"),
+                x="AverageRevenue", y="Country", orientation="h",
+                title="Top countries by average revenue per paying player"
+            ))
+
+        # 12. Genre × gender average spend
+        if "Gender" in paying.columns:
+            gg = (
+                paying.groupby(["GameGenre", "Gender"], as_index=False)["InAppPurchaseAmount"]
+                .mean().rename(columns={"InAppPurchaseAmount": "AverageSpend"})
+            )
+            if not gg.empty:
+                charts["fig_gender_genre"] = fig_json(px.bar(
+                    gg, x="AverageSpend", y="GameGenre", color="Gender",
+                    barmode="group", orientation="h",
+                    title="Average spend by genre and gender"
+                ))
+
+        # 13. Device total revenue
+        device_rev = (
+            paying.groupby("Device", as_index=False)["InAppPurchaseAmount"]
+            .sum().rename(columns={"InAppPurchaseAmount": "Revenue"})
+        )
+        charts["fig_device_revenue"] = fig_json(px.bar(
+            device_rev.sort_values("Revenue", ascending=False),
+            x="Device", y="Revenue", text_auto=".2f",
+            title="Total in-app purchase revenue by device"
+        ))
+
+        # 14. Age distribution of paying users
+        if "Age" in paying.columns:
+            charts["fig_age"] = fig_json(px.histogram(
+                paying, x="Age", nbins=20,
+                title="Age distribution of paying players"
+            ))
+
+        # 15. Engagement profile by segment
+        engagement = paying.groupby("SpendingSegment", as_index=False).agg(
+            AvgSessions=("SessionCount", "mean"),
+            AvgSessionLength=("AverageSessionLength", "mean")
+        )
+        charts["fig_engagement"] = fig_json(px.bar(
+            engagement, x="SpendingSegment",
+            y=["AvgSessions", "AvgSessionLength"], barmode="group",
+            title="Engagement profile by spending segment"
+        ))
+
+    cols = [c for c in [
+        "UserID", "Age", "Gender", "Country", "Device", "GameGenre",
+        "SessionCount", "AverageSessionLength", "SpendingSegment",
+        "InAppPurchaseAmount", "FirstPurchaseDaysAfterInstall", "PaymentMethod"
+    ] if c in df.columns]
+
+    table_data = df[cols].head(100).to_dict(orient="records")
 
     return {
         "kpis": kpis,
         "charts": charts,
+        "insights": generate_insights(df, paying),
         "table_cols": cols,
         "table_data": table_data,
+        "row_count": len(df),
         "empty": df.empty
     }
 
@@ -183,20 +311,14 @@ def index():
     segments = ["Whale", "Dolphin", "Minnow"]
     devices = sorted(BASE_DF["Device"].dropna().unique())
     countries = sorted(BASE_DF["Country"].dropna().unique())
-
-    return render_template(
-        "index.html",
-        genres=genres,
-        segments=segments,
-        devices=devices,
-        countries=countries
-    )
+    return render_template("index.html", genres=genres, segments=segments,
+                           devices=devices, countries=countries)
 
 @app.route("/api/filter", methods=["POST"])
 def api_filter():
     data = request.get_json() or {}
     filtered_df = filter_gaming_dataset(
-        df=BASE_DF,
+        BASE_DF,
         genres=data.get("genres"),
         segments=data.get("segments"),
         devices=data.get("devices"),
@@ -208,7 +330,7 @@ def api_filter():
 def download_csv():
     data = request.get_json() or {}
     filtered_df = filter_gaming_dataset(
-        df=BASE_DF,
+        BASE_DF,
         genres=data.get("genres"),
         segments=data.get("segments"),
         devices=data.get("devices"),
@@ -221,6 +343,28 @@ def download_csv():
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment;filename=freemium_game_analytics.csv"}
     )
+
+@app.route("/api/ai-insights", methods=["POST"])
+def api_ai_insights():
+    data = request.get_json() or {}
+    
+    # Filter dataset based on current sidebar selections
+    filtered_df = filter_gaming_dataset(
+        BASE_DF,
+        genres=data.get("genres"),
+        segments=data.get("segments"),
+        devices=data.get("devices"),
+        countries=data.get("countries")
+    )
+    
+    analytics = generate_analytics_payload(filtered_df)
+    
+    llm_summary = generate_llm_insights(
+        kpis=analytics["kpis"],
+        filter_summary=data
+    )
+    
+    return jsonify({"ai_summary": llm_summary})
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
