@@ -6,7 +6,7 @@ __pycache__/
 .idea/
 
 # Data & Large Artifacts
-data/raw/*.csv
+# data/raw/*.csv
 data/processed/*.csv
 outputs/models/*.pkl
 outputs/models/*.joblib
