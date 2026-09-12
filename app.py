@@ -201,8 +201,8 @@ def generate_analytics_payload(df: pd.DataFrame):
         device_df["ARPU"] = device_df["Revenue"] / device_df["Users"].replace(0, pd.NA)
         charts["fig_device"] = fig_json(px.bar(
             device_df.sort_values("ARPU", ascending=False),
-            x="Device", y="ARPU", text_auto=".2f",
-            title="ARPU by device platform"
+            x="Device", y="ARPU", text_auto=".2f", labels={"ARPU": "ARPPU"},
+            title="Revenue per paying user (ARPPU) by device platform"
         ))
 
         # 8. Country player volume
