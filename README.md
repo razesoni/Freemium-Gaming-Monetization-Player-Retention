@@ -100,10 +100,5 @@ Author / contact
 - Author: Akash Kumar Singh (GitHub profile at https://github.com/razesoni)
 - For recruiters: I’m available to discuss this project, walk through the code and analysis, or present the findings in a short technical/product demo.
 
-License
-- No LICENSE file included. Add a license (e.g., MIT) if you plan to publish or share broadly.
-
-Next steps I can take (if you want)
-- Commit this README to the default branch.
-- Produce a concise one-page PDF summary for non-technical audiences.
-- Create a small sample CSV in data/ so reviewers can run the demo without the original dataset.
+Live Site
+https://freemium-gaming-monetization-player.onrender.com/
